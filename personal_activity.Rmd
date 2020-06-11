@@ -1,0 +1,153 @@
+---
+title: "Quality of Personal Activity Project"
+output: html_document
+---
+
+## Introduction
+
+With the increase of the widespread use of personal activity tracking devices, it is now possible to collect a large amount of data about personal activity relatively inexpensive. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways.
+
+In this project, our goal is to build a machine learning model and correctly identify 20 test cases available in the test dataset.
+
+## Project Overview
+
+Since the goal is to correctly identify 20 test cases we need not bother with the interpretability and can choose the best performing model. To replicate the real world application we will partition train dataset into training (80% of the training data) and validation dataset (20% of the training data), and save the true test dataset (with 20 subjects) untill the very end.
+
+Feature selection. Again, since the goal of this project isto correctly identify the 20 subjects we will ignore columns with more than 19 NAs in the final testing dataset. Thus we train our model on the columns that are present and no empty in the final test dataset.
+
+We are going to consider the most accurate models: random forsts, gradient boosting with trees, and bagging.
+
+## Getting the Data
+
+Data for this project comes from Groupware: [http://groupware.les.inf.puc-rio.br/har]
+
+```{r Downloading Data setoptions, echo=TRUE, message=FALSE}
+if(!file.exists('pers_act_train.csv')){
+        download.file('https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv', 'pers_act_train.csv')
+}
+if(!file.exists('pers_act_test.csv')){
+        download.file('https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv', 'pers_act_test.csv')
+}
+training <- read.csv('pers_act_train.csv')
+testing <- read.csv('pers_act_test.csv')
+```
+
+## Coding Housekeepng
+
+```{r}
+set.seed(111)
+library(caret)
+library(dplyr)
+library(ggplot2)
+library(parallel)
+library(doParallel)
+```
+
+
+## Variables of Interest
+
+Want to ensure we have the same variables in both datasets and we will set up training and validation sets
+
+```{r}
+to_test <- testing[,colSums(is.na(testing))<20 ]
+to_test <- subset(to_test, select = -c(X,user_name,raw_timestamp_part_1,raw_timestamp_part_2,cvtd_timestamp, new_window,num_window, problem_id))
+cols_to_keep <- names(to_test)
+to_train <- select(training, append(cols_to_keep,'classe'))
+```
+
+## Exploratory Data Anaysis
+
+Before we begin with model fitting we need to understand what we are predicting and what out dataset looks like:
+
+```{r}
+ggplot(data = to_train, aes(x=classe)) + geom_bar(position='dodge') + xlab('Exercise Quality') + ggtitle('Bar Chart of classe variable') + theme_minimal() + ylim(0, 6000)
+
+```
+The most highly occuring class is A ~5500 times. Apart form A being overrepresented there are no other issues with predicted variable representation.
+
+## Model Fitting
+
+# Principal Component Analysis
+
+We need to reduce number of features:
+```{r}
+train_index <- createDataPartition(to_train$classe, p = 0.8, list = FALSE, )
+to_train_s <- to_train[train_index,]
+to_validate_s <- to_train[-train_index,]
+
+pca_process <- preProcess(subset(to_train_s, select = -c(classe)), method = 'pca', thresh = 0.95)
+pca_train <- predict(pca_process, subset(to_train_s, select = -c(classe)))
+pca_validation <- predict(pca_process, subset(to_validate_s, select = -c(classe)))
+pca_test <- predict(pca_process, to_test)
+```
+
+Building models: gradient boosted trees and random forst
+
+```{r}
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+
+fitControl <- trainControl(method = "repeatedcv", number = 5, allowParallel = TRUE)
+mtry <- floor(sqrt(ncol(pca_train)))+2
+tunegrid <- expand.grid(.mtry=mtry, .ntree = 700)
+rf_model <- train(classe ~ ., method = 'rf', metric = "Accuracy", data = data.frame(pca_train, classe=to_train_s$classe) , trControl = fitControl)
+
+stopCluster(cluster)
+registerDoSEQ()
+```
+
+```{r}
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+
+fitControl <- trainControl(method = "repeatedcv", number = 5, allowParallel = TRUE)
+gbm_model <- train(classe ~ ., method = 'gbm', metric = "Accuracy", data = data.frame(pca_train, classe=to_train_s$classe), trControl = fitControl, tuneGrid = expand.grid(interaction.depth = 7, n.trees = 140, shrinkage = 0.23, n.minobsinnode = 10), verbose = FALSE)
+
+stopCluster(cluster)
+registerDoSEQ()
+```
+
+Evaluation of the Random Forest and GBM:
+```{r}
+confusionMatrix(predict(rf_model, pca_validation), to_validate_s$classe)
+confusionMatrix(predict(gbm_model, pca_validation), to_validate_s$classe)
+```
+
+Random forest performs much better than the gradient boosting. Let's now tune random forest's paramters, mtry and ntree
+
+Tuning rf_model:
+```{r}
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+
+control <- trainControl(method = 'repeatedcv', number = 5, search = 'grid')
+tunegrid <- expand.grid(.mtry=c(1:15))
+rf_gridsearch <- train(classe ~ ., method = 'rf', metric = "Accuracy", data = data.frame(pca_train, classe=to_train_s$classe) , trControl = control, tuneGrid=tunegrid, .ntree = 700)
+
+stopCluster(cluster)
+registerDoSEQ()
+
+qplot(rf_gridsearch$results$mtry, rf_gridsearch$results$Accuracy) + geom_line() +
+        ylab("Validation Accuracy Score") +
+        theme_bw()+
+        scale_x_discrete(name = "mtry Parameter Values", limits= c(1:15))+
+        ylim(0.96, 0.98)
+```
+
+Best paramter for mtry is 4
+
+Evaluation of the Random Forest:
+```{r}
+confusionMatrix(predict(rf_gridsearch, pca_validation), to_validate_s$classe)
+```
+
+
+## Prediction on the Test Set
+
+After perfomring cross validation we now predict classes of the test set at the very end:
+
+```{r}
+predict(rf_gridsearch, pca_test)
+```
+
+
